@@ -1,0 +1,304 @@
+---
+title: "Moneyball"
+author: "Robert Schwanbeck"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    toc: yes
+    number_sections: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+cd <- "/home/robert/Documents/Boston_College/Boston_College/Econometrics/HW1" 
+```
+
+# Setup
+
+## Empty variables and functions in the environment tab/window
+
+First, empty the environment so that we can upload the clean data.  
+```{r clear, eval=TRUE, echo=TRUE}
+
+# Set working directory and path to data
+  setwd(cd)
+
+# Clear the workspace
+  rm(list = ls()) # Clear environment
+  gc()            # Clear unused memory
+  cat("\f")       # Clear the console
+
+```
+
+
+
+## Load packages
+
+Now, we load the packages.  
+
+```{r packages, echo=TRUE}
+
+# Prepare needed libraries
+packages <- c("psych","tidyverse", "caret", "ggplot2", "lattice", "olsrr", "glmnet", "recipes", "caret", "broom", "dplyr", "tibble")
+
+  for (i in 1:length(packages)) {
+    if (!packages[i] %in% rownames(installed.packages())) {
+      install.packages(packages[i]
+                       , repos = "http://cran.rstudio.com/"
+                       , dependencies = TRUE
+                       )
+    }
+    library(packages[i], character.only = TRUE)
+  }
+
+rm(packages)
+
+```
+
+
+## Load raw data
+
+```{r import data}
+
+# Load with common blanks treated as NA
+df_train <- read.csv(
+  "moneyball-training-data.csv",
+  na.strings = c("", " ", "NA", "N/A", "na", "n/a", "-", "—", "NULL", "null")
+)
+df_eval  <- read.csv(
+  "moneyball-evaluation-data.csv",
+  na.strings = c("", " ", "NA", "N/A", "na", "n/a", "-", "—", "NULL", "null")
+)
+
+#################################
+if (FALSE) {
+describe(df_train)
+describe(df_eval)
+
+colSums(is.na(df_train))
+colSums(is.na(df_eval))
+
+summary(df_train)
+summary(df_eval)
+
+?print # years "Total Years:"
+print(x = 2006-1871+1,
+      digits = 1)
+136*162
+}
+#################################
+
+# Keep only the expected columns (order doesn’t matter)
+expected <- c(
+  "INDEX","TARGET_WINS",
+  "TEAM_BATTING_H","TEAM_BATTING_2B","TEAM_BATTING_3B","TEAM_BATTING_HR",
+  "TEAM_BATTING_BB","TEAM_BATTING_SO","TEAM_BASERUN_SB","TEAM_BASERUN_CS",
+  "TEAM_BATTING_HBP",
+  "TEAM_PITCHING_H","TEAM_PITCHING_HR","TEAM_PITCHING_BB","TEAM_PITCHING_SO",
+  "TEAM_FIELDING_E","TEAM_FIELDING_DP"
+)
+
+df_train <- df_train |> dplyr::select(dplyr::any_of(expected))
+df_eval  <- df_eval  |> dplyr::select(dplyr::any_of(setdiff(expected, "TARGET_WINS")))
+
+# Quick missingness report
+missing_train <- sort(colMeans(is.na(df_train)), decreasing = TRUE)
+missing_eval  <- sort(colMeans(is.na(df_eval)),  decreasing = TRUE)
+
+print("Top missing columns (train):"); print(head(missing_train, 10))
+print("Top missing columns (eval):");  print(head(missing_eval, 10))
+
+```
+
+```{r sparse columns}
+# Identify very-sparse predictors (ignore target and index)
+preds_all <- setdiff(expected, c("INDEX","TARGET_WINS"))
+sparse_train <- names(which(colMeans(is.na(df_train[preds_all])) > 0.80))
+if (length(sparse_train)) {
+  message("Dropping very sparse columns: ", paste(sparse_train, collapse=", "))
+}
+
+keep_preds <- setdiff(preds_all, sparse_train)
+
+df_train2 <- df_train |> dplyr::select(dplyr::any_of(c("INDEX","TARGET_WINS", keep_preds)))
+df_eval2  <- df_eval  |> dplyr::select(dplyr::any_of(c("INDEX", keep_preds)))
+
+```
+
+
+```{r impute}
+set.seed(123)
+
+# Impute medians learned from TRAIN, then (optionally) normalize for modeling
+rec_imp <- recipes::recipe(TARGET_WINS ~ ., data = df_train2) |>
+  recipes::update_role(INDEX, new_role = "id") |>
+  recipes::step_zv(recipes::all_predictors()) |>
+  recipes::step_impute_median(recipes::all_numeric_predictors())
+
+prep_imp <- recipes::prep(rec_imp)
+
+# Imputed (not scaled) data for record-keeping/EDA
+train_imputed <- recipes::bake(prep_imp, new_data = NULL)
+eval_imputed  <- recipes::bake(prep_imp, new_data = df_eval2)
+
+# Save imputed datasets
+write.csv(train_imputed, "train_imputed.csv", row.names = FALSE)
+write.csv(eval_imputed,  "eval_imputed.csv",  row.names = FALSE)
+```
+
+```{r predict}
+# Add normalization only for the modeling matrix
+rec_model <- rec_imp |>
+  recipes::step_normalize(recipes::all_numeric_predictors())
+
+prep_model <- recipes::prep(rec_model)
+
+x_train <- recipes::bake(prep_model, new_data = NULL) |>
+  dplyr::select(-INDEX, -TARGET_WINS) |>
+  as.matrix()
+
+y_train <- train_imputed$TARGET_WINS
+
+# Elastic net (alpha=0.5) with CV to pick lambda
+fit <- glmnet::cv.glmnet(
+  x = x_train,
+  y = y_train,
+  family = "gaussian",
+  alpha = 0.5,
+  nfolds = 10
+)
+
+# Coefficients at lambda.min
+coef_table <- broom::tidy(glmnet::glmnet(x_train, y_train, family = "gaussian"),
+                          return_zeros = TRUE)
+print(head(coef_table, 20))
+
+```
+
+```{r evaluation}
+x_eval <- recipes::bake(prep_model, new_data = df_eval2) |>
+  dplyr::select(-INDEX) |>
+  as.matrix()
+
+
+
+pred_eval <- as.numeric(predict(fit, x_eval, s = "lambda.min", type = "link"))
+
+out <- df_eval2 |> dplyr::select(INDEX) |>
+  dplyr::mutate(P_TARGET_WINS = pred_eval)
+
+write.csv(out, "moneyball-eval-predictions.csv", row.names = FALSE)
+head(out)
+
+```
+
+```{r eval2}
+
+
+set.seed(123)
+
+#----------------------------
+# 1) Train/validation split
+#----------------------------
+idx <- createDataPartition(df_train2$TARGET_WINS, p = 0.80, list = FALSE)
+train_cv <- df_train2[idx, ]
+valid_cv <- df_train2[-idx, ]
+
+# Recipe: impute medians (from train), then normalize predictors
+rec_imp_cv <- recipe(TARGET_WINS ~ ., data = train_cv) |>
+  update_role(INDEX, new_role = "id") |>
+  step_zv(all_predictors()) |>
+  step_impute_median(all_numeric_predictors())
+
+rec_model_cv <- rec_imp_cv |>
+  step_normalize(all_numeric_predictors())
+
+prep_model_cv <- prep(rec_model_cv)
+
+# Matrices
+x_tr <- bake(prep_model_cv, new_data = NULL) |>
+  select(-INDEX, -TARGET_WINS) |>
+  as.matrix()
+y_tr <- bake(prep_model_cv, new_data = NULL) |>
+  pull(TARGET_WINS)
+
+x_va <- bake(prep_model_cv, new_data = valid_cv) |>
+  select(-INDEX, -TARGET_WINS) |>
+  as.matrix()
+y_va <- valid_cv$TARGET_WINS
+
+# Fit elastic net with CV (alpha=0.5)
+fit_cv <- cv.glmnet(x_tr, y_tr, family = "gaussian", alpha = 0.5, nfolds = 10)
+
+#----------------------------
+# Metrics on validation set
+#----------------------------
+y_hat_va <- as.numeric(predict(fit_cv, x_va, s = "lambda.min", type = "link"))
+mae  <- mean(abs(y_va - y_hat_va))
+rmse <- sqrt(mean((y_va - y_hat_va)^2))
+mae; rmse  # <- mirrors your MAE / RMSE block
+
+#----------------------------
+# Coefficients (wins per 1 SD)
+#----------------------------
+# Coefs at lambda.min (standardized-X scale)
+beta <- as.matrix(coef(fit_cv, s = "lambda.min"))
+coef_tbl <- tibble(
+  term = rownames(beta),
+  estimate_sd = as.numeric(beta)  # change in wins per +1 SD of predictor
+) |>
+  filter(term != "(Intercept)") |>
+  arrange(desc(abs(estimate_sd)))
+
+head(coef_tbl, 15)
+
+# Optional: simple importance plot (per 1 SD change)
+ggplot(head(coef_tbl, 15),
+       aes(x = reorder(term, abs(estimate_sd)), y = estimate_sd)) +
+  geom_col() +
+  coord_flip() +
+  labs(x = NULL, y = "Δ Wins per +1 SD of predictor", title = "Top elastic-net coefficients (λ = lambda.min)")
+
+# If you want wins per *one original unit* for each variable:
+train_imp_for_scale <- bake(prep(rec_imp_cv), new_data = NULL)
+pred_cols <- setdiff(names(train_imp_for_scale), c("INDEX","TARGET_WINS"))
+sds <- sapply(train_imp_for_scale[, pred_cols], sd, na.rm = TRUE)
+
+coef_tbl_orig <- coef_tbl |>
+  mutate(
+    sd_x = sds[term],
+    wins_per_1unit = estimate_sd / sd_x,      # Δ wins per +1 original unit
+    wins_per_100   = wins_per_1unit * 100     # handy scale
+  ) |>
+  arrange(desc(abs(wins_per_1unit)))
+
+head(coef_tbl_orig, 15)
+
+#----------------------------
+# $ per additional win (if Payroll exists)
+#----------------------------
+# Use predicted wins on the training fold as the "marginal value" driver.
+y_hat_tr <- as.numeric(predict(fit_cv, x_tr, s = "lambda.min", type = "link"))
+
+if ("Payroll" %in% names(train_cv)) {
+  # Simple spec; add your controls if you have them
+  lm_cost <- lm(Payroll ~ y_hat_tr, data = transform(train_cv, y_hat_tr = y_hat_tr))
+  summary(lm_cost)
+  # Interpretation: coefficient on y_hat_tr ≈ dollars per (predicted) win.
+} else {
+  message("No 'Payroll' column found; skipping $ per win estimation.")
+}
+
+#----------------------------
+# Predict on the evaluation file
+#----------------------------
+x_eval <- bake(prep_model_cv, new_data = df_eval2) |>
+  select(-INDEX) |>
+  as.matrix()
+
+pred_eval <- as.numeric(predict(fit_cv, x_eval, s = "lambda.min", type = "link"))
+out <- df_eval2 |> select(INDEX) |> mutate(P_TARGET_WINS = pred_eval)
+write.csv(out, "moneyball-eval-predictions.csv", row.names = FALSE)
+
+```
